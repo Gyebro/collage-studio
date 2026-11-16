@@ -1,6 +1,7 @@
 """Collage Studio: local image collage editor and print-quality renderer."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
@@ -22,7 +23,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("COLLAGE_DATA_DIR", str(BASE_DIR / "data"))).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="Collage Studio", version="0.1.0")
+app = FastAPI(title="Collage Studio", version="0.2.0")
 
 MAX_UPLOAD = 75 * 1024 * 1024
 MAX_ZIP = 1024 * 1024 * 1024
@@ -39,6 +40,13 @@ class LayoutRequest(BaseModel):
     showcase: int = Field(default=6, ge=1, le=30)
     ratio_width: float = Field(default=4.0, gt=0, le=100)
     ratio_height: float = Field(default=5.0, gt=0, le=100)
+    border_percent: float = Field(default=0.0, ge=0, le=30)
+    border_color: str = Field(default="#ffffff", pattern=r"^#[0-9a-fA-F]{6}$")
+
+
+class AppearanceRequest(BaseModel):
+    border_percent: float = Field(ge=0, le=30)
+    border_color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
 
 
 class TransformRequest(BaseModel):
@@ -70,7 +78,11 @@ def project_folder(project_id: str) -> Path:
 def load_project(project_id: str) -> dict[str, Any]:
     path = project_folder(project_id) / "project.json"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        project = json.loads(path.read_text(encoding="utf-8"))
+        # Bundles produced by v0.1 did not have border settings.
+        project.setdefault("border_percent", 0.0)
+        project.setdefault("border_color", "#ffffff")
+        return project
     except (OSError, json.JSONDecodeError):
         raise HTTPException(500, "Cannot read project configuration")
 
@@ -129,11 +141,45 @@ def create_project(layout: dict[str, Any]) -> dict:
     return project
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def ensure_fingerprints(p: dict) -> None:
+    """Backfill hashes for projects created before duplicate detection existed."""
+    changed = False
+    folder = project_folder(p["id"])
+    for tile in p["tiles"].values():
+        if not re.fullmatch(r"[0-9a-f]{64}", str(tile.get("sha256", ""))):
+            tile["sha256"] = sha256_file(image_path(folder, tile))
+            changed = True
+    if changed:
+        save_project(p["id"], p)
+
+
+def duplicate_diagnostics(p: dict) -> dict:
+    groups: dict[str, list[str]] = {}
+    for key, tile in p["tiles"].items():
+        groups.setdefault(tile["sha256"], []).append(key)
+    repeated = [
+        {"cells": sorted(keys), "filenames": [p["tiles"][key]["original_filename"] for key in sorted(keys)]}
+        for keys in groups.values() if len(keys) > 1
+    ]
+    repeated.sort(key=lambda entry: entry["cells"][0])
+    return {"duplicate_groups": repeated, "duplicate_repeats": sum(len(g["cells"]) - 1 for g in repeated)}
+
+
 def api_project(p: dict) -> dict:
+    ensure_fingerprints(p)
     result = dict(p)
     result["expected_cells"] = len(expected_keys(p))
     result["filled_cells"] = len(p["tiles"])
     result["showcase_bounds"] = list(showcase_bounds(p))
+    result.update(duplicate_diagnostics(p))
     return result
 
 
@@ -216,9 +262,25 @@ def paint_tile(base: Image.Image, src_path: Path, rect: tuple[int, int, int, int
         base.paste(crop, (x0, y0))
 
 
+def content_rect(
+    x_edges: list[int], y_edges: list[int],
+    extent: tuple[int, int, int, int], gap: int,
+) -> tuple[int, int, int, int]:
+    """Inset only shared edges; keep the exterior edge of the collage border-free."""
+    c0, r0, c1, r1 = extent
+    left = x_edges[c0] + (gap // 2 if c0 else 0)
+    right = x_edges[c1] - (gap - gap // 2 if c1 < len(x_edges) - 1 else 0)
+    top = y_edges[r0] + (gap // 2 if r0 else 0)
+    bottom = y_edges[r1] - (gap - gap // 2 if r1 < len(y_edges) - 1 else 0)
+    return left, top, right, bottom
+
+
 def render_collage(p: dict, folder: Path, output: Path, size: tuple[int, int], dpi: int, quality: int) -> None:
     width, height = size
-    canvas = Image.new("RGB", (width, height), "#e8e7e2")
+    # Width is a percentage of the shortest *small* grid-cell edge; the gap
+    # therefore stays proportional across output pixel sizes and print DPI.
+    gap = round(min(width / p["columns"], height / p["rows"]) * p.get("border_percent", 0) / 100)
+    canvas = Image.new("RGB", (width, height), p.get("border_color", "#ffffff"))
     x_edges = [round(c * width / p["columns"]) for c in range(p["columns"] + 1)]
     y_edges = [round(r * height / p["rows"]) for r in range(p["rows"] + 1)]
     x0, y0, x1, y1 = showcase_bounds(p)
@@ -226,13 +288,15 @@ def render_collage(p: dict, folder: Path, output: Path, size: tuple[int, int], d
         for c in range(p["columns"]):
             if x0 <= c < x1 and y0 <= r < y1:
                 continue
+            rect = content_rect(x_edges, y_edges, (c, r, c + 1, r + 1), gap)
+            canvas.paste("#e8e7e2", rect)
             tile = p["tiles"].get(f"r{r}c{c}")
             if tile:
-                rect = (x_edges[c], y_edges[r], x_edges[c + 1], y_edges[r + 1])
                 paint_tile(canvas, image_path(folder, tile), rect, tile)
+    hero_rect = content_rect(x_edges, y_edges, (x0, y0, x1, y1), gap)
+    canvas.paste("#e8e7e2", hero_rect)
     if "showcase" in p["tiles"]:
-        rect = (x_edges[x0], y_edges[y0], x_edges[x1], y_edges[y1])
-        paint_tile(canvas, image_path(folder, p["tiles"]["showcase"]), rect, p["tiles"]["showcase"])
+        paint_tile(canvas, image_path(folder, p["tiles"]["showcase"]), hero_rect, p["tiles"]["showcase"])
     canvas.save(output, format="JPEG", quality=quality, subsampling=0, dpi=(dpi, dpi), optimize=True)
 
 
@@ -250,7 +314,7 @@ def static_file(filename: str):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "version": "0.1.0"}
+    return {"ok": True, "version": "0.2.0"}
 
 
 @app.post("/api/projects")
@@ -288,6 +352,7 @@ async def upload_image(project_id: str, cell: str = Form(...), file: UploadFile 
     p["tiles"][cell] = {
         "asset": asset,
         "original_filename": (file.filename or "image")[:250],
+        "sha256": hashlib.sha256(raw).hexdigest(),
         "zoom": 1.0,
         "pan_x": 0.0,
         "pan_y": 0.0,
@@ -297,6 +362,14 @@ async def upload_image(project_id: str, cell: str = Form(...), file: UploadFile 
         old_image = folder / "images" / old["asset"]
         old_image.unlink(missing_ok=True)
         (folder / "previews" / (Path(old["asset"]).stem + ".jpg")).unlink(missing_ok=True)
+    return api_project(p)
+
+
+@app.patch("/api/projects/{project_id}/appearance")
+def update_appearance(project_id: str, req: AppearanceRequest):
+    p = load_project(project_id)
+    p.update(req.model_dump())
+    save_project(project_id, p)
     return api_project(p)
 
 
@@ -340,7 +413,8 @@ def get_preview(project_id: str, image_id: str):
 @app.get("/api/projects/{project_id}/config.json")
 def download_config(project_id: str):
     p = load_project(project_id)
-    payload = dict(p)
+    ensure_fingerprints(p)
+    payload = json.loads(json.dumps(p))
     # configuration references portable asset paths, available in the full ZIP
     for tile in payload["tiles"].values():
         tile["path"] = "images/" + tile["asset"]
@@ -350,6 +424,7 @@ def download_config(project_id: str):
 @app.get("/api/projects/{project_id}/bundle.zip")
 def download_bundle(project_id: str):
     p = load_project(project_id)
+    ensure_fingerprints(p)
     folder = project_folder(project_id)
     output = folder / "collage-project.zip"
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=4) as archive:
@@ -381,7 +456,11 @@ async def import_bundle(file: UploadFile = File(...)):
                 if info.file_size > 2_000_000:
                     raise ValueError("Configuration exceeds size limit")
                 saved = json.loads(archive.read(info))
-                layout = LayoutRequest(**{k: saved[k] for k in ("columns", "rows", "showcase", "ratio_width", "ratio_height")})
+                layout = LayoutRequest(**{
+                    **{k: saved[k] for k in ("columns", "rows", "showcase", "ratio_width", "ratio_height")},
+                    "border_percent": saved.get("border_percent", 0),
+                    "border_color": saved.get("border_color", "#ffffff"),
+                })
                 if layout.showcase > min(layout.columns, layout.rows):
                     raise ValueError("Showcase does not fit in grid")
                 raw_tiles = saved.get("tiles", {})
@@ -419,6 +498,7 @@ async def import_bundle(file: UploadFile = File(...)):
                     )
                     verified[key] = (asset, {
                         "original_filename": str(tile.get("original_filename", "image"))[:250],
+                        "sha256": hashlib.sha256(body).hexdigest(),
                         **transform.model_dump(),
                     })
                 p = create_project(layout.model_dump())

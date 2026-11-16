@@ -42,10 +42,17 @@
           <div class="subtle-note"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></svg><span>The center showcase counts as one image, even though it spans multiple cells.</span></div>
         </section>
         <section class="panel">
-          <div class="section-title"><h3>Canvas settings</h3><span class="pill">Fixed for this project</span></div>
+          <div class="section-title"><h3>Canvas settings</h3><span class="pill">Customizable border</span></div>
           <div class="setting-line"><span>Grid size</span><strong id="settingGrid">10 × 10</strong></div>
           <div class="setting-line"><span>Showcase</span><strong id="settingShowcase">6 × 6 cells</strong></div>
           <div class="setting-line"><span>Aspect ratio</span><strong id="settingRatio">4 : 5</strong></div>
+          <div class="appearance-controls">
+            <div class="control-heading"><label for="borderWidthRange">Gap between photos</label><strong id="borderWidthValue">0%</strong></div>
+            <input id="borderWidthRange" type="range" min="0" max="30" step="0.5" value="0" />
+            <div class="range-labels"><span>No gap</span><span>30%</span></div>
+            <div class="appearance-color"><label for="borderColorInput">Border colour</label><input id="borderColorInput" type="color" value="#ffffff" aria-label="Photo border colour" /><span id="borderColorValue">#FFFFFF</span></div>
+            <p class="appearance-note">Uniform gap measured as % of the smaller tile side. Applied to the JPEG; no outer border.</p>
+          </div>
           <button class="btn btn-soft btn-full" id="changeLayoutBtn"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 17h16M8 4v6M16 14v6"/></svg>Start with another layout</button>
         </section>
         <section class="panel how-panel">
@@ -74,7 +81,7 @@
           </div>
           <div class="canvas-helper"><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v4h16v-4"/></svg><span id="canvasHelperText">Click any square to upload a photo, or drag and drop images onto the canvas.</span></div>
         </div>
-        <div class="workspace-foot"><span><span class="purple-dot"></span><strong id="imageStatus">0 / 65 images placed</strong></span><span id="canvasDimensionNote">10 × 10 photo grid</span></div>
+        <div class="workspace-foot"><div class="workspace-status-group"><span><span class="purple-dot"></span><strong id="imageStatus">0 / 65 images placed</strong></span><button type="button" id="duplicateStatus" class="duplicate-chip clean" title="Check repeated photos">✓ No repeats</button></div><span id="canvasDimensionNote">10 × 10 photo grid</span></div>
       </section>
 
       <aside class="sidebar sidebar-right">
@@ -121,6 +128,14 @@
       </div>
       <div class="modal-footer"><button type="button" data-close="newProjectDialog" class="btn btn-outline">Cancel</button><button class="btn btn-primary" type="submit">Create project <span class="button-arrow">→</span></button></div>
     </form>
+  </dialog>
+
+  <dialog id="duplicatesDialog" class="modal">
+    <div class="modal-inner">
+      <div class="modal-head"><div class="modal-glyph">◎</div><div><div class="panel-overline">PHOTO DIAGNOSTICS</div><h2>Duplicate image check</h2><p id="duplicateSummary">No identical photo files have been reused.</p></div><button type="button" class="modal-close" data-close="duplicatesDialog" aria-label="Close dialog">×</button></div>
+      <div class="modal-body"><div id="duplicateDetails" class="duplicate-details"></div><div class="duplicate-explainer">This check compares the contents of uploaded files (SHA-256), not filenames. A separately edited or compressed copy may not be flagged.</div></div>
+      <div class="modal-footer"><button type="button" data-close="duplicatesDialog" class="btn btn-primary">Done</button></div>
+    </div>
   </dialog>
 
   <dialog id="renderDialog" class="modal">

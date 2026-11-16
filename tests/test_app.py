@@ -106,3 +106,108 @@ def test_error_and_limits(client):
     bad=client.post(url+'/images',data={'cell':'r0c0'},files={'file':('bad.png',b'not an image','image/png')})
     assert bad.status_code==400
     assert client.post('/api/import-zip',files={'file':('bad.zip',b'abc','application/zip')}).status_code==400
+
+
+def test_uniform_photo_borders_and_no_outer_border(client):
+    p = client.post('/api/projects', json={}).json()
+    url = f'/api/projects/{p["id"]}'
+    assert p['border_percent'] == 0
+    assert p['border_color'] == '#ffffff'
+    assert client.patch(url+'/appearance', json={
+        'border_percent': 10, 'border_color': '#11cc33'
+    }).status_code == 200
+    assert client.patch(url+'/appearance', json={
+        'border_percent': 31, 'border_color': '#11cc33'
+    }).status_code == 422
+    assert client.patch(url+'/appearance', json={
+        'border_percent': 10, 'border_color': 'green'
+    }).status_code == 422
+    client.post(url+'/images', data={'cell': 'r0c0'}, files={
+        'file': ('corner.png', sample_image('red'), 'image/png')
+    })
+    client.post(url+'/images', data={'cell': 'showcase'}, files={
+        'file': ('hero.png', sample_image('blue'), 'image/png')
+    })
+    resp = client.post(url+'/render', json={'width': 400, 'unit': 'px', 'dpi': 300, 'quality': 100})
+    assert resp.status_code == 200
+    im = Image.open(io.BytesIO(resp.content))
+    assert im.size == (400, 500)
+    # Grid cell size is 40x50, gap is 10% of 40 => exactly 4 pixels.
+    # Between the first and second tiles: pixels 38,39,40,41 are green.
+    for x in range(38,42):
+        r,g,b = im.getpixel((x,25))
+        assert g > 180 and r < 60 and b < 90, (x, (r,g,b))
+    r,g,b = im.getpixel((37,25))
+    assert r > 225 and g < 45
+    assert im.getpixel((0,25))[0] > 225  # no outer border
+    assert im.getpixel((20,0))[0] > 225
+    # Between small cells and the showcase at x=80 / y=125.
+    for x in range(78,82):
+        r,g,b = im.getpixel((x,125))
+        assert g > 180 and r < 60 and b < 90, (x, (r,g,b))
+    assert im.getpixel((84,125))[2] > 210  # showcase remains blue
+    for y in range(48,52):
+        r,g,b = im.getpixel((20,y))
+        assert g > 180 and r < 60 and b < 90, (y, (r,g,b))
+    cfg = client.get(url+'/config.json').json()
+    assert cfg['border_percent'] == 10
+    assert cfg['border_color'] == '#11cc33'
+    z = client.get(url+'/bundle.zip')
+    imported = client.post('/api/import-zip', files={'file':('copy.zip',z.content,'application/zip')})
+    assert imported.status_code == 200, imported.text
+    assert imported.json()['border_percent'] == 10
+    assert imported.json()['border_color'] == '#11cc33'
+
+
+def test_exact_duplicate_diagnostic_upload_replace_remove_and_import(client):
+    p = client.post('/api/projects', json={}).json()
+    url = f'/api/projects/{p["id"]}'
+    body = sample_image('#dc1478')
+    res = client.post(url+'/images', data={'cell':'r0c0'},files={'file':('a.png',body,'image/png')})
+    assert res.json()['duplicate_repeats'] == 0
+    res = client.post(url+'/images', data={'cell':'r0c1'},files={'file':('different-name.png',body,'image/png')})
+    dup = res.json()
+    assert dup['duplicate_repeats'] == 1
+    assert len(dup['duplicate_groups']) == 1
+    assert dup['duplicate_groups'][0]['cells'] == ['r0c0', 'r0c1']
+    assert dup['duplicate_groups'][0]['filenames'] == ['a.png', 'different-name.png']
+    res = client.post(url+'/images', data={'cell':'showcase'},files={'file':('a.png',body,'image/png')})
+    assert res.json()['duplicate_repeats'] == 2
+    assert len(res.json()['duplicate_groups'][0]['cells']) == 3
+    assert res.json()['tiles']['r0c0']['asset'] != res.json()['tiles']['r0c1']['asset']
+    other = sample_image('#0000ff')
+    res = client.post(url+'/images', data={'cell':'r0c1'},files={'file':('a.png',other,'image/png')})
+    assert res.json()['duplicate_repeats'] == 1  # matching filename doesn't matter
+    assert res.json()['duplicate_groups'][0]['cells'] == ['r0c0','showcase']
+    zipres = client.get(url+'/bundle.zip')
+    imported = client.post('/api/import-zip',files={'file':('export.zip',zipres.content,'application/zip')})
+    assert imported.status_code == 200
+    assert imported.json()['duplicate_repeats'] == 1
+    assert client.delete(url+'/tiles/showcase').json()['duplicate_repeats'] == 0
+
+
+def test_legacy_zip_import_falls_back_to_edge_to_edge_and_rehashes(client):
+    p = client.post('/api/projects', json={}).json()
+    url = f'/api/projects/{p["id"]}'
+    body = sample_image('red')
+    for cell in ('r0c0','r0c1'):
+        client.post(url+'/images',data={'cell':cell},files={'file':('same.png',body,'image/png')})
+    zipres=client.get(url+'/bundle.zip')
+    old=io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(zipres.content)) as archive, zipfile.ZipFile(old,'w') as legacy:
+        for entry in archive.infolist():
+            contents=archive.read(entry.filename)
+            if entry.filename=='project.json':
+                cfg=json.loads(contents)
+                del cfg['border_percent']
+                del cfg['border_color']
+                for tile in cfg['tiles'].values():
+                    del tile['sha256']
+                contents=json.dumps(cfg).encode()
+            legacy.writestr(entry.filename,contents)
+    restored=client.post('/api/import-zip',files={'file':('legacy.zip',old.getvalue(),'application/zip')})
+    assert restored.status_code == 200, restored.text
+    assert restored.json()['border_percent'] == 0
+    assert restored.json()['border_color'] == '#ffffff'
+    assert restored.json()['duplicate_repeats'] == 1
+    assert all(len(tile['sha256'])==64 for tile in restored.json()['tiles'].values())

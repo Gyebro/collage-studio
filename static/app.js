@@ -52,6 +52,21 @@
     const r = +parts[1], c = +parts[2];
     return { x:c*w/p.columns, y:r*h/p.rows, w:w/p.columns, h:h/p.rows };
   }
+  function contentRectFor(key, p, w, h) {
+    const rect = rectFor(key,p,w,h);
+    if (!rect) return null;
+    const gap = Math.min(w/p.columns,h/p.rows) * (p.border_percent || 0) / 100;
+    let c0,r0,c1,r1;
+    if (key === 'showcase') [c0,r0,c1,r1] = bounds(p);
+    else {
+      const parts = /^r(\d+)c(\d+)$/.exec(key);
+      if (!parts) return null;
+      r0=+parts[1]; c0=+parts[2]; r1=r0+1; c1=c0+1;
+    }
+    const l=c0>0?gap/2:0, t=r0>0?gap/2:0;
+    const r=c1<p.columns?gap/2:0, b=r1<p.rows?gap/2:0;
+    return {x:rect.x+l,y:rect.y+t,w:Math.max(0,rect.w-l-r),h:Math.max(0,rect.h-t-b)};
+  }
   function cellFromPoint(clientX, clientY) {
     const p = state.project;
     if (!p) return null;
@@ -136,7 +151,7 @@
   }
   function drawTile(key,w,h) {
     const p = state.project;
-    const rect = rectFor(key,p,w,h);
+    const rect = contentRectFor(key,p,w,h);
     if (!rect) return;
     const tile = p.tiles[key];
     if (!tile) drawPlaceholder(key,rect);
@@ -152,7 +167,7 @@
         ctx.fillStyle = '#e9e7ef';ctx.fillRect(rect.x,rect.y,rect.w,rect.h);
       }
     }
-    if (state.showGrid) {
+    if (state.showGrid && !(p.border_percent > 0)) {
       ctx.strokeStyle = '#ffffffdb'; ctx.lineWidth = 1.1;
       ctx.strokeRect(rect.x+.55,rect.y+.55,Math.max(0,rect.w-1.1),Math.max(0,rect.h-1.1));
     }
@@ -175,7 +190,7 @@
     const bw=Math.round(w*dpr),bh=Math.round(h*dpr);
     if (canvas.width !== bw || canvas.height !== bh) {canvas.width=bw;canvas.height=bh;}
     ctx.setTransform(dpr,0,0,dpr,0,0);
-    ctx.fillStyle='#eeedf3';ctx.fillRect(0,0,w,h);
+    ctx.fillStyle=state.project.border_color || '#ffffff';ctx.fillRect(0,0,w,h);
     for (const key of cells(state.project)) drawTile(key,w,h);
     if (state.fineTune && state.selected) drawHighlight(state.selected,'selected');
     else if (state.hovered && !state.fineTune) drawHighlight(state.hovered,'hovered');
@@ -210,6 +225,7 @@
     state.pendingPatches.clear();
     state.patchGeneration++;
     state.project=p;
+    syncAppearanceControls();
     state.selected=null;
     state.hovered=null;
     state.dropTarget=null;
@@ -235,6 +251,11 @@
     $('emptyCount').textContent=remaining;
     $('totalCount').textContent=count;
     $('imageStatus').textContent=`${filled} / ${count} images placed`;
+    const repeats=p.duplicate_repeats || 0, duplicateBtn=$('duplicateStatus');
+    duplicateBtn.classList.toggle('repeated',repeats>0);
+    duplicateBtn.classList.toggle('clean',repeats===0);
+    duplicateBtn.textContent=repeats ? `⚠ ${repeats} ${repeats===1?'repeat':'repeats'}` : '✓ No repeats';
+    duplicateBtn.title=repeats ? 'Click to see which photo files are repeated' : 'No exact duplicate photo files; click for details';
     $('percentageLabel').textContent=`${Math.round(filled/count*100)}% complete`;
     $('progressBar').style.width=`${filled/count*100}%`;
     $('canvasHelperText').textContent=state.fineTune
@@ -287,6 +308,7 @@
     saveStatus('Uploading photo…');
     const form=new FormData();form.append('cell',key);form.append('file',file,file.name);
     try {
+      await flushTransforms();
       const response=await request(`/api/projects/${state.project.id}/images`,{method:'POST',body:form});
       state.project=await response.json();
       state.selected=key;
@@ -299,8 +321,12 @@
   function queuePatch(entry) {
     state.patchSequence = state.patchSequence.catch(() => {}).then(async () => {
       try {
-        await request(`/api/projects/${entry.projectId}/tiles/${entry.cell}`, {
-          method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(entry.transform)
+        const url=entry.appearance
+          ? `/api/projects/${entry.projectId}/appearance`
+          : `/api/projects/${entry.projectId}/tiles/${entry.cell}`;
+        await request(url, {
+          method:'PATCH',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(entry.appearance || entry.transform)
         });
         if (state.patchGeneration === entry.generation && !state.pendingPatches.size) {
           saveStatus('All changes saved');
@@ -337,6 +363,57 @@
     state.pendingPatches.set(token,entry);
     saveStatus('Saving adjustments…');
   }
+  function syncAppearanceControls() {
+    const p=state.project;
+    $('borderWidthRange').value=p.border_percent ?? 0;
+    $('borderColorInput').value=p.border_color || '#ffffff';
+    $('borderWidthValue').textContent=`${Number(p.border_percent || 0)}%`;
+    $('borderColorValue').textContent=(p.border_color || '#ffffff').toUpperCase();
+  }
+  function scheduleAppearance() {
+    const p=state.project;
+    if (!p) return;
+    const token=`${p.id}/appearance`;
+    const existing=state.pendingPatches.get(token);
+    if (existing) clearTimeout(existing.timer);
+    const entry={projectId:p.id,generation:state.patchGeneration,
+      appearance:{border_percent:p.border_percent,border_color:p.border_color}};
+    entry.timer=setTimeout(()=>flushPatch(token),280);
+    state.pendingPatches.set(token,entry);
+    saveStatus('Saving border…');
+  }
+  function applyAppearance(which,value) {
+    const p=state.project;
+    if (!p) return;
+    if (which === 'border_percent') p.border_percent=clamp(Number(value),0,30);
+    if (which === 'border_color' && /^#[0-9a-fA-F]{6}$/.test(value)) p.border_color=value;
+    syncAppearanceControls();draw();scheduleAppearance();
+  }
+  function showDuplicates() {
+    const p=state.project;
+    if (!p) return;
+    const groups=p.duplicate_groups || [];
+    $('duplicateSummary').textContent=groups.length
+      ? `${p.duplicate_repeats} repeated ${p.duplicate_repeats===1?'placement':'placements'} across ${groups.length} ${groups.length===1?'photo':'photos'}.`
+      : 'No identical photo files have been reused.';
+    const details=$('duplicateDetails');details.replaceChildren();
+    if (!groups.length) {
+      const empty=document.createElement('p');empty.className='duplicate-empty';
+      empty.textContent='✓ All placed photos are unique (based on their original file contents).';
+      details.appendChild(empty);
+    }
+    for (const group of groups) {
+      const block=document.createElement('div');block.className='duplicate-group';
+      const title=document.createElement('strong');title.textContent=`Same photo in ${group.cells.length} cells`;
+      const list=document.createElement('ul');
+      group.cells.forEach((cell,i)=>{
+        const item=document.createElement('li');item.textContent=`${cellName(cell)} — ${group.filenames[i]}`;
+        list.appendChild(item);
+      });
+      block.append(title,list);details.appendChild(block);
+    }
+    $('duplicatesDialog').showModal();
+  }
   function applyTransform(which,value) {
     const tile=state.project?.tiles[state.selected];if(!tile)return;
     if(which==='zoom') tile.zoom=clamp(value/100,1,4);
@@ -362,7 +439,7 @@
       selectCell(key);
       const tile=state.project.tiles[key];
       if(!tile){chooseImage(key);return;}
-      const img=getImage(tile),rect=rectFor(key,state.project,canvas.clientWidth,canvas.clientHeight);
+      const img=getImage(tile),rect=contentRectFor(key,state.project,canvas.clientWidth,canvas.clientHeight);
       if(img.naturalWidth && rect){
         const m=imageMetrics(img,tile,rect);
         state.pointerDrag={key,startX:e.clientX,startY:e.clientY,panX:tile.pan_x,panY:tile.pan_y,overflowX:m.ox,overflowY:m.oy};
@@ -464,6 +541,10 @@
   $('fineTuneBtn').addEventListener('click',()=>setFineTune(true));
   $('enableFineTuneBtn').addEventListener('click',()=>setFineTune(true));
   $('gridLinesCheck').addEventListener('change',e=>{state.showGrid=e.target.checked;draw();});
+  $('borderWidthRange').addEventListener('input',e=>applyAppearance('border_percent',e.target.value));
+  $('borderColorInput').addEventListener('input',e=>applyAppearance('border_color',e.target.value));
+  $('borderColorInput').addEventListener('change',e=>applyAppearance('border_color',e.target.value));
+  $('duplicateStatus').addEventListener('click',showDuplicates);
   $('zoomRange').addEventListener('input',e=>applyTransform('zoom',+e.target.value));
   $('panXRange').addEventListener('input',e=>applyTransform('pan_x',+e.target.value));
   $('panYRange').addEventListener('input',e=>applyTransform('pan_y',+e.target.value));
